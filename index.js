@@ -16,6 +16,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import {
   McpServer,
 } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -26,16 +28,49 @@ dotenv.config();
 
 const JOBNIMBUS_BASE_URL = "https://app.jobnimbus.com/api1";
 const JOBNIMBUS_API_KEY = process.env.JOBNIMBUS_API_KEY;
-// Optional simple shared-secret so random people on the internet can't hit
-// your server. Set MCP_SHARED_SECRET in your env and pass the same value
-// as a header when adding the connector, if your host supports it.
-const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET || null;
 
 if (!JOBNIMBUS_API_KEY) {
   console.error(
     "FATAL: JOBNIMBUS_API_KEY is not set. Add it to your environment before starting the server."
   );
   process.exit(1);
+}
+
+// -----------------------------------------------------------------------
+// Minimal OAuth 2.1 (authorization code + PKCE) layer.
+//
+// Claude's custom connector "Individual sign-in" flow requires the target
+// server to speak OAuth — it does a browser redirect to /authorize and
+// then exchanges a code at /token. This server has no real "users," so it
+// auto-approves any request from the registered client and issues signed,
+// stateless JWTs as access/refresh tokens. Under the hood, every MCP call
+// still just uses your single JOBNIMBUS_API_KEY.
+// -----------------------------------------------------------------------
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
+const OAUTH_SIGNING_SECRET = process.env.OAUTH_SIGNING_SECRET;
+
+if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET || !OAUTH_SIGNING_SECRET) {
+  console.error(
+    "FATAL: OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, and OAUTH_SIGNING_SECRET must all be set."
+  );
+  process.exit(1);
+}
+
+// In-memory store for short-lived authorization codes (a few minutes old,
+// single-instance server — fine for this use case).
+const authCodes = new Map(); // code -> { redirectUri, codeChallenge, codeChallengeMethod, expiresAt }
+
+function issueAccessToken() {
+  return jwt.sign({ type: "access" }, OAUTH_SIGNING_SECRET, { expiresIn: "30d" });
+}
+function issueRefreshToken() {
+  return jwt.sign({ type: "refresh" }, OAUTH_SIGNING_SECRET, { expiresIn: "180d" });
+}
+function verifyAccessToken(token) {
+  const payload = jwt.verify(token, OAUTH_SIGNING_SECRET);
+  if (payload.type !== "access") throw new Error("Wrong token type");
+  return payload;
 }
 
 /** Low-level helper for all JobNimbus REST calls */
@@ -317,20 +352,148 @@ function buildServer() {
 }
 
 // -----------------------------------------------------------------------
-// Express app hosting the MCP server over Streamable HTTP transport.
-// This is what you deploy; the resulting public URL + "/mcp" path is what
-// gets entered as the custom connector URL in Claude.ai.
+// Express app hosting the MCP server over Streamable HTTP transport, plus
+// the OAuth endpoints Claude's connector flow needs.
 // -----------------------------------------------------------------------
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Tell OAuth-aware clients (like Claude) where the auth endpoints live.
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint: `${base}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+  });
+});
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  const base = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    resource: `${base}/mcp`,
+    authorization_servers: [base],
+  });
+});
+
+// Step 1 of the OAuth dance: Claude's browser gets redirected here. Since
+// this server has exactly one "user" (you), we auto-approve immediately
+// instead of showing a login page.
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } =
+    req.query;
+
+  if (response_type !== "code") {
+    return res.status(400).send("Only response_type=code is supported.");
+  }
+  if (client_id !== OAUTH_CLIENT_ID) {
+    return res.status(401).send("Unknown client_id.");
+  }
+  if (!redirect_uri) {
+    return res.status(400).send("Missing redirect_uri.");
+  }
+
+  const code = crypto.randomBytes(24).toString("hex");
+  authCodes.set(code, {
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge || null,
+    codeChallengeMethod: code_challenge_method || null,
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+  });
+
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  if (state) redirectUrl.searchParams.set("state", state);
+  res.redirect(302, redirectUrl.toString());
+});
+
+// Step 2: exchange the code (or a refresh token) for an access token.
+app.post("/token", (req, res) => {
+  const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier, refresh_token } =
+    req.body;
+
+  // Client auth can arrive as Basic auth instead of body params.
+  let effectiveClientId = client_id;
+  let effectiveClientSecret = client_secret;
+  const authHeader = req.headers["authorization"];
+  if (!effectiveClientId && authHeader?.startsWith("Basic ")) {
+    const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+    const [id, secret] = decoded.split(":");
+    effectiveClientId = id;
+    effectiveClientSecret = secret;
+  }
+
+  if (effectiveClientId !== OAUTH_CLIENT_ID || effectiveClientSecret !== OAUTH_CLIENT_SECRET) {
+    return res.status(401).json({ error: "invalid_client" });
+  }
+
+  if (grant_type === "authorization_code") {
+    const entry = authCodes.get(code);
+    if (!entry || entry.expiresAt < Date.now()) {
+      return res.status(400).json({ error: "invalid_grant", error_description: "Code expired or unknown." });
+    }
+    if (entry.redirectUri !== redirect_uri) {
+      return res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch." });
+    }
+    if (entry.codeChallenge) {
+      if (!code_verifier) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "Missing code_verifier." });
+      }
+      const computed = crypto
+        .createHash("sha256")
+        .update(code_verifier)
+        .digest("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+      if (computed !== entry.codeChallenge) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed." });
+      }
+    }
+    authCodes.delete(code);
+    return res.json({
+      access_token: issueAccessToken(),
+      refresh_token: issueRefreshToken(),
+      token_type: "Bearer",
+      expires_in: 60 * 60 * 24 * 30,
+    });
+  }
+
+  if (grant_type === "refresh_token") {
+    try {
+      const payload = jwt.verify(refresh_token, OAUTH_SIGNING_SECRET);
+      if (payload.type !== "refresh") throw new Error("Wrong token type");
+    } catch {
+      return res.status(400).json({ error: "invalid_grant", error_description: "Invalid refresh token." });
+    }
+    return res.json({
+      access_token: issueAccessToken(),
+      refresh_token: issueRefreshToken(),
+      token_type: "Bearer",
+      expires_in: 60 * 60 * 24 * 30,
+    });
+  }
+
+  return res.status(400).json({ error: "unsupported_grant_type" });
+});
 
 app.post("/mcp", async (req, res) => {
-  if (MCP_SHARED_SECRET) {
-    const provided = req.headers["x-mcp-secret"];
-    if (provided !== MCP_SHARED_SECRET) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
+  const authHeader = req.headers["authorization"] || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  try {
+    verifyAccessToken(token);
+  } catch {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
   }
 
   const server = buildServer();
