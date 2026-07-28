@@ -660,6 +660,107 @@ function buildServer() {
     }
   );
 
+  // ---------- MATERIAL ORDERS ----------
+  server.registerTool(
+    "jobnimbus_list_material_orders",
+    {
+      title: "List JobNimbus Material Orders",
+      description:
+        "List/search material orders (MOs) — exact-match filters include the MO number itself, so you can look up a specific Material Order by its # (e.g. '1001') the same way it's searchable in JobNimbus's own UI. Also filterable by related job/contact, status, sales rep, and date ranges.",
+      inputSchema: {
+        ...commonListFields,
+        number: z.string().optional().describe("Exact material order number (MO#), e.g. '1001'."),
+        relatedJnid: z.string().optional().describe("jnid of the job/contact this MO is related to."),
+        statusName: z.string().optional().describe("Exact status name, e.g. 'Draft', 'Ordered', 'Received'."),
+        salesRepName: z.string().optional(),
+        dateMaterialOrderFrom: z.string().optional().describe("ISO date — the MO's own date."),
+        dateMaterialOrderTo: z.string().optional(),
+        dateStatusChangeFrom: z.string().optional(),
+        dateStatusChangeTo: z.string().optional(),
+      },
+    },
+    async (params) => {
+      const filter = buildFilter([
+        termClause("number", params.number),
+        termClause("related.id", params.relatedJnid),
+        termClause("status_name", params.statusName),
+        termClause("sales_rep_name", params.salesRepName),
+        rangeClause("date_materialorder", toUnixSeconds(params.dateMaterialOrderFrom), toUnixSeconds(params.dateMaterialOrderTo)),
+        rangeClause("date_status_change", toUnixSeconds(params.dateStatusChangeFrom), toUnixSeconds(params.dateStatusChangeTo)),
+      ]);
+      const data = await jobNimbusRequest("/v2/materialorders", { query: commonListQuery(params), filter });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "jobnimbus_get_material_order",
+    {
+      title: "Get JobNimbus Material Order",
+      description: "Fetch a single material order by its jnid (use jobnimbus_list_material_orders with a 'number' filter first if you only have the MO#).",
+      inputSchema: { jnid: z.string() },
+    },
+    async ({ jnid }) => {
+      const data = await jobNimbusRequest(`/v2/materialorders/${jnid}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "jobnimbus_create_material_order",
+    {
+      title: "Create JobNimbus Material Order",
+      description: "Create a new material order, related to a job/contact.",
+      inputSchema: {
+        relatedJnid: z.string().describe("jnid of the job/contact this MO is for."),
+        status_name: z.string().optional().default("Draft"),
+        internal_note: z.string().optional(),
+        customer_note: z.string().optional(),
+        items: z
+          .array(
+            z.object({
+              name: z.string(),
+              description: z.string().optional(),
+              quantity: z.number(),
+              cost: z.number().optional(),
+              price: z.number().optional(),
+              uom: z.string().optional(),
+              sku: z.string().optional(),
+              category: z.string().optional(),
+            })
+          )
+          .describe("Line items for the material order."),
+        extraFields: z.record(z.any()).optional(),
+      },
+    },
+    async ({ relatedJnid, items, extraFields, ...fields }) => {
+      const body = {
+        ...fields,
+        related: [{ id: relatedJnid }],
+        items,
+        ...(extraFields || {}),
+      };
+      const data = await jobNimbusRequest("/v2/materialorders", { method: "POST", body });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "jobnimbus_update_material_order",
+    {
+      title: "Update JobNimbus Material Order",
+      description: "Update fields on an existing material order (e.g. change status, update items).",
+      inputSchema: {
+        jnid: z.string().describe("The jnid of the material order to update."),
+        fields: z.record(z.any()).describe("Key/value fields to update, e.g. { status_name: 'Ordered' }"),
+      },
+    },
+    async ({ jnid, fields }) => {
+      const data = await jobNimbusRequest(`/v2/materialorders/${jnid}`, { method: "PUT", body: fields });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
   return server;
 }
 
