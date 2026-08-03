@@ -44,8 +44,9 @@ if (!JOBNIMBUS_API_KEY) {
   process.exit(1);
 }
 
-// Commission rate per sales rep, as a fraction of the approved job total.
-// Update this table whenever a rate changes or a rep is added/removed.
+// Flat commission rate per sales rep, applied to the job total. This ONLY
+// applies to Re-Roof jobs. Update whenever a rate changes or a rep is
+// added/removed.
 const COMMISSION_RATES = {
   "Chuck Canastraro": 0.10,
   "Dave Sanchez": 0.10,
@@ -55,6 +56,50 @@ const COMMISSION_RATES = {
   "Shellé Frievalt": 0.07,
   "Luis Quinones": 0,
 };
+
+// Repair jobs don't use COMMISSION_RATES — every rep is on the same
+// "10/50/50" structure: Rhino takes a flat cut off the top, then whatever's
+// left after labor/material cost is split evenly with the rep.
+const REPAIR_RULE = {
+  rhinoOffTopPct: 0.10,
+  repShareOfRemainder: 0.50,
+};
+
+/**
+ * Classify a SumoQuote estimate as "Repair" or "Re-Roof" from its own
+ * section names and line-item text (the most reliable signal, since it's
+ * set by whoever built the quote). Falls back to "Unclassified" — callers
+ * should treat that as "needs a human to check," not silently default to
+ * either commission formula.
+ */
+function classifyJobType(estimate) {
+  const text = [
+    ...(estimate.sections || []).map((s) => s.name || ""),
+    ...(estimate.items || []).map((i) => `${i.name || ""} ${i.description || ""}`),
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  if (/repair|patch/.test(text)) return "Repair";
+  if (/re-?roof|replacement|tear.?off|full roof/.test(text)) return "Re-Roof";
+  return "Unclassified";
+}
+
+function computeCommission(estimate, jobType) {
+  const total = estimate.total || 0;
+  if (jobType === "Repair") {
+    const cost = estimate.cost || 0;
+    const afterRhinoCut = total * (1 - REPAIR_RULE.rhinoOffTopPct);
+    const profitAfterCost = afterRhinoCut - cost;
+    return profitAfterCost * REPAIR_RULE.repShareOfRemainder;
+  }
+  // Re-Roof (and Unclassified, with a warning) fall back to the flat rate.
+  const rate = COMMISSION_RATES[estimate.sales_rep_name];
+  if (rate === undefined) {
+    console.warn(`  No commission rate on file for "${estimate.sales_rep_name}" — defaulting to 0%.`);
+  }
+  return total * (rate ?? 0);
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -133,8 +178,9 @@ async function writeWorkbook(rows, fromDate, toDate) {
     { header: "Customer / Job", key: "jobName", width: 36 },
     { header: "Job #", key: "jobNumber", width: 10 },
     { header: "Estimate #", key: "estimateNumber", width: 12 },
+    { header: "Job Type", key: "jobType", width: 14 },
     { header: "Job Total", key: "total", width: 14 },
-    { header: "Commission Rate", key: "rate", width: 14 },
+    { header: "Labor + Material Cost", key: "cost", width: 18 },
     { header: "Commission Amount", key: "commission", width: 16 },
     { header: "SumoQuote PDF", key: "pdfPath", width: 40 },
     { header: "JobNimbus Job Link", key: "jobUrl", width: 44 },
@@ -143,8 +189,11 @@ async function writeWorkbook(rows, fromDate, toDate) {
   rows.forEach((r) => {
     const row = sheet.addRow(r);
     row.getCell("total").numFmt = "$#,##0.00";
-    row.getCell("rate").numFmt = "0%";
+    row.getCell("cost").numFmt = "$#,##0.00";
     row.getCell("commission").numFmt = "$#,##0.00";
+    if (r.jobType === "Unclassified") {
+      row.getCell("jobType").font = { color: { argb: "FFCC0000" }, bold: true };
+    }
   });
 
   const summarySheet = wb.addWorksheet("By Rep");
@@ -167,6 +216,22 @@ async function writeWorkbook(rows, fromDate, toDate) {
     row.getCell("total").numFmt = "$#,##0.00";
     row.getCell("commission").numFmt = "$#,##0.00";
   });
+
+  const rateSheet = wb.addWorksheet("Rate Table");
+  rateSheet.getCell("A1").value = "Sales Rep";
+  rateSheet.getCell("B1").value = "Re-Roof Commission Rate";
+  rateSheet.getRow(1).font = { bold: true };
+  Object.entries(COMMISSION_RATES).forEach(([rep, rate], i) => {
+    rateSheet.getCell(`A${i + 2}`).value = rep;
+    const cell = rateSheet.getCell(`B${i + 2}`);
+    cell.value = rate;
+    cell.numFmt = "0%";
+  });
+  rateSheet.getCell("A1").font = { bold: true };
+  rateSheet.getCell(`A${Object.keys(COMMISSION_RATES).length + 4}`).value =
+    "Repair jobs don't use this table — they're on the fixed 10/50/50 rule in computeCommission().";
+  rateSheet.getColumn("A").width = 20;
+  rateSheet.getColumn("B").width = 22;
 
   const fileName =
     fromDate === toDate
@@ -195,9 +260,9 @@ async function main() {
   const rows = [];
   for (const est of estimates) {
     const job = (est.related || []).find((r) => r.type === "job");
-    const rate = COMMISSION_RATES[est.sales_rep_name];
-    if (rate === undefined) {
-      console.warn(`  No commission rate on file for "${est.sales_rep_name}" — defaulting to 0%.`);
+    const jobType = classifyJobType(est);
+    if (jobType === "Unclassified") {
+      console.warn(`  Could not tell if estimate #${est.number} is a Repair or Re-Roof — flagged for manual review.`);
     }
 
     let pdfPath = "(not available)";
@@ -207,16 +272,16 @@ async function main() {
     }
 
     const total = est.total || 0;
-    const appliedRate = rate ?? 0;
     rows.push({
       dateApproved: new Date(est.date_status_change * 1000).toISOString().slice(0, 10),
       salesRep: est.sales_rep_name || "(unassigned)",
       jobName: job?.name || "",
       jobNumber: job?.number || "",
       estimateNumber: est.number,
+      jobType,
       total,
-      rate: appliedRate,
-      commission: total * appliedRate,
+      cost: est.cost || 0,
+      commission: computeCommission(est, jobType),
       pdfPath,
       jobUrl: job ? `https://app.jobnimbus.com/job/${job.id}` : "",
     });
