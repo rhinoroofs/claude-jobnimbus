@@ -95,6 +95,42 @@ JobNimbus API1 structure, but **before relying on it**:
 Want more (e.g. invoices, documents, work orders)? These follow the same
 pattern — say the word and I'll add tools for them.
 
+## Daily SumoQuote commission report
+
+`commission-report.js` is a standalone script (not an MCP tool — just run it
+directly with Node) that builds a daily sales-commission spreadsheet:
+
+1. Pulls every SumoQuote estimate that was **Approved** (signed by the
+   customer) on a given day from JobNimbus.
+2. Downloads each one's SumoQuote PDF.
+3. Writes an `.xlsx` workbook — one row per sale, a "By Rep" summary sheet,
+   and each rep's commission calculated from the rate table at the top of
+   the script — that a sales rep can use as backup for their commission
+   invoice.
+
+```bash
+JOBNIMBUS_API_KEY=xxx node commission-report.js --date 2026-08-03
+# or a range:
+JOBNIMBUS_API_KEY=xxx node commission-report.js --from 2026-08-01 --to 2026-08-03
+```
+
+Output: `commission-report-<date>.xlsx` and `commission-pdfs/<date>/*.pdf`
+in the current directory.
+
+Commission rates are hardcoded in the `COMMISSION_RATES` table near the top
+of `commission-report.js` — update it there whenever a rate changes or a
+rep is added/removed. Reps not listed default to 0% (and the script warns
+about it), so a missing rep never silently gets paid the wrong amount.
+
+**Known gaps to verify against your account before relying on this daily:**
+- JobNimbus's `status_name` filter matches against a lowercased index —
+  the script already passes `"approved"`, not `"Approved"` — but if any
+  other status name stops matching, try lowercasing it first.
+- The `/files/{id}` PDF download endpoint follows JobNimbus's documented
+  pattern but hasn't been confirmed against this account. If PDFs come
+  back empty/404, check Settings → API for the exact attachment-download
+  path.
+
 ## Security notes
 
 - Your JobNimbus API key lives only in this server's environment variables —
