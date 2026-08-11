@@ -760,7 +760,111 @@ function buildServer() {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
+// ---------- WORK ORDERS ----------
+  server.registerTool(
+    "jobnimbus_list_work_orders",
+    {
+      title: "List JobNimbus Work Orders",
+      description:
+        "List/search work orders (WOs) — exact-match filters include the WO number, related job/contact, workflow name (record_type_name — e.g. 'Metal Trim + Accessories', 'Metal Roll Forming'), status, sales rep, and date ranges.",
+      inputSchema: {
+        ...commonListFields,
+        number: z.string().optional().describe("Exact work order number (WO#), e.g. '6173'."),
+        relatedJnid: z.string().optional().describe("jnid of the job/contact this WO is related to."),
+        recordTypeName: z.string().optional().describe("Workflow name, e.g. 'Metal Trim + Accessories', 'Metal Roll Forming', 'Repair'."),
+        statusName: z.string().optional().describe("Exact status name within that workflow."),
+        salesRepName: z.string().optional(),
+        dateWorkOrderFrom: z.string().optional().describe("ISO date — the WO's own date."),
+        dateWorkOrderTo: z.string().optional(),
+        dateStatusChangeFrom: z.string().optional(),
+        dateStatusChangeTo: z.string().optional(),
+      },
+    },
+    async (params) => {
+      const filter = buildFilter([
+        termClause("number", params.number),
+        termClause("related.id", params.relatedJnid),
+        termClause("record_type_name", params.recordTypeName),
+        termClause("status_name", params.statusName),
+        termClause("sales_rep_name", params.salesRepName),
+        rangeClause("date_workorder", toUnixSeconds(params.dateWorkOrderFrom), toUnixSeconds(params.dateWorkOrderTo)),
+        rangeClause("date_status_change", toUnixSeconds(params.dateStatusChangeFrom), toUnixSeconds(params.dateStatusChangeTo)),
+      ]);
+      const data = await jobNimbusRequest("/v2/workorders", { query: commonListQuery(params), filter });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
 
+  server.registerTool(
+    "jobnimbus_get_work_order",
+    {
+      title: "Get JobNimbus Work Order",
+      description: "Fetch a single work order by its jnid (use jobnimbus_list_work_orders with a 'number' filter first if you only have the WO#).",
+      inputSchema: { jnid: z.string() },
+    },
+    async ({ jnid }) => {
+      const data = await jobNimbusRequest(`/v2/workorders/${jnid}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "jobnimbus_create_work_order",
+    {
+      title: "Create JobNimbus Work Order",
+      description:
+        "Create a new work order, related to a job/contact. record_type_name must match one of the account's configured work order workflows (call jobnimbus_get_account_settings to see valid names), and status_name must be valid within that workflow.",
+      inputSchema: {
+        relatedJnid: z.string().describe("jnid of the job/contact this WO is for."),
+        record_type_name: z.string().describe("Workflow name, e.g. 'Metal Trim + Accessories' (required)."),
+        status_name: z.string().describe("Initial status, must exist within that workflow (required)."),
+        internal_note: z.string().optional(),
+        customer_note: z.string().optional(),
+        items: z
+          .array(
+            z.object({
+              name: z.string(),
+              description: z.string().optional(),
+              quantity: z.number(),
+              cost: z.number().optional(),
+              price: z.number().optional(),
+              uom: z.string().optional(),
+              sku: z.string().optional(),
+              category: z.string().optional(),
+            })
+          )
+          .optional()
+          .describe("Line items for the work order."),
+        extraFields: z.record(z.any()).optional(),
+      },
+    },
+    async ({ relatedJnid, items, extraFields, ...fields }) => {
+      const body = {
+        ...fields,
+        related: [{ id: relatedJnid }],
+        ...(items ? { items } : {}),
+        ...(extraFields || {}),
+      };
+      const data = await jobNimbusRequest("/v2/workorders", { method: "POST", body });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "jobnimbus_update_work_order",
+    {
+      title: "Update JobNimbus Work Order",
+      description: "Update fields on an existing work order (e.g. change status, update items, notes).",
+      inputSchema: {
+        jnid: z.string().describe("The jnid of the work order to update."),
+        fields: z.record(z.any()).describe("Key/value fields to update, e.g. { status_name: 'Trim & Accessories Ready' }"),
+      },
+    },
+    async ({ jnid, fields }) => {
+      const data = await jobNimbusRequest(`/v2/workorders/${jnid}`, { method: "PUT", body: fields });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
   return server;
 }
 
