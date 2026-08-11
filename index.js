@@ -36,16 +36,6 @@ if (!JOBNIMBUS_API_KEY) {
   process.exit(1);
 }
 
-// -----------------------------------------------------------------------
-// Minimal OAuth 2.1 (authorization code + PKCE) layer.
-//
-// Claude's custom connector "Individual sign-in" flow requires the target
-// server to speak OAuth — it does a browser redirect to /authorize and
-// then exchanges a code at /token. This server has no real "users," so it
-// auto-approves any request from the registered client and issues signed,
-// stateless JWTs as access/refresh tokens. Under the hood, every MCP call
-// still just uses your single JOBNIMBUS_API_KEY.
-// -----------------------------------------------------------------------
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
 const OAUTH_SIGNING_SECRET = process.env.OAUTH_SIGNING_SECRET;
@@ -57,9 +47,7 @@ if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET || !OAUTH_SIGNING_SECRET) {
   process.exit(1);
 }
 
-// In-memory store for short-lived authorization codes (a few minutes old,
-// single-instance server — fine for this use case).
-const authCodes = new Map(); // code -> { redirectUri, codeChallenge, codeChallengeMethod, expiresAt }
+const authCodes = new Map();
 
 function issueAccessToken() {
   return jwt.sign({ type: "access" }, OAUTH_SIGNING_SECRET, { expiresIn: "30d" });
@@ -73,7 +61,6 @@ function verifyAccessToken(token) {
   return payload;
 }
 
-/** Low-level helper for all JobNimbus REST calls */
 async function jobNimbusRequest(path, { method = "GET", body, query, filter } = {}) {
   let url = `${JOBNIMBUS_BASE_URL}${path}`;
   const allQuery = { ...(query || {}) };
@@ -114,13 +101,11 @@ async function jobNimbusRequest(path, { method = "GET", body, query, filter } = 
   return parsed;
 }
 
-/** Build a single Elasticsearch "term" clause (exact match). */
 function termClause(field, value) {
   if (value === undefined || value === null || value === "") return null;
   return { term: { [field]: value } };
 }
 
-/** Build a single Elasticsearch "range" clause (numeric or date, both as gte/lte). */
 function rangeClause(field, gte, lte) {
   const range = {};
   if (gte !== undefined && gte !== null && gte !== "") range.gte = gte;
@@ -128,13 +113,11 @@ function rangeClause(field, gte, lte) {
   return Object.keys(range).length > 0 ? { range: { [field]: range } } : null;
 }
 
-/** Wrap an array of clauses (some possibly null) into JobNimbus's {must:[...]} filter shape. */
 function buildFilter(clauses) {
   const must = clauses.filter(Boolean);
   return must.length > 0 ? { must } : null;
 }
 
-/** Convert an ISO date string (or unix seconds number) to unix seconds for JobNimbus date fields. */
 function toUnixSeconds(value) {
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value === "number") return Math.floor(value);
@@ -143,7 +126,6 @@ function toUnixSeconds(value) {
   return Math.floor(parsed / 1000);
 }
 
-/** Shared pagination/sort/field-limiting params reused across every list tool. */
 const commonListFields = {
   size: z
     .number()
@@ -164,14 +146,12 @@ function commonListQuery({ size = 25, from = 0, sortField, sortDirection, fields
   return { size, from, sort_field: sortField, sort_direction: sortDirection, fields };
 }
 
-/** Build the MCP server and register tools */
 function buildServer() {
   const server = new McpServer({
     name: "jobnimbus-mcp",
     version: "1.0.0",
   });
 
-  // ---------- ACCOUNT / REFERENCE ----------
   server.registerTool(
     "jobnimbus_get_account_settings",
     {
@@ -199,7 +179,6 @@ function buildServer() {
     }
   );
 
-  // ---------- JOBS ----------
   server.registerTool(
     "jobnimbus_list_jobs",
     {
@@ -312,7 +291,6 @@ function buildServer() {
     }
   );
 
-  // ---------- CONTACTS ----------
   server.registerTool(
     "jobnimbus_list_contacts",
     {
@@ -390,7 +368,6 @@ function buildServer() {
     }
   );
 
-  // ---------- TASKS ----------
   server.registerTool(
     "jobnimbus_list_tasks",
     {
@@ -450,17 +427,17 @@ function buildServer() {
     }
   );
 
-  // ---------- ACTIVITIES (notes + status-change log) ----------
   server.registerTool(
     "jobnimbus_list_activities",
     {
       title: "List JobNimbus Activities",
       description:
-        "List activity/note entries — this includes JobNimbus's status-change history (each status change on a job/contact logs an activity with is_status_change=true) as well as manually-added notes. Use relatedJnid to see all activity for one job/contact; use isStatusChange=true to see only status transitions.",
+        "List activity/note entries — this includes JobNimbus's status-change history (each status change on a job/contact logs an activity with is_status_change=true) as well as manually-added notes and other logged events like change orders. Use relatedJnid to see all activity for one job/contact; use isStatusChange=true to see only status transitions; use recordTypeName to filter to a specific activity type (e.g. 'Extras/Change order').",
       inputSchema: {
         ...commonListFields,
         relatedJnid: z.string().optional().describe("jnid of a job or contact to see all activity for."),
         isStatusChange: z.boolean().optional().describe("Filter to only status-change events (true) or only manual notes (false)."),
+        recordTypeName: z.string().optional().describe("Exact activity type name to filter by, e.g. 'Extras/Change order', 'Status Changed', 'Task Created'. See jobnimbus_get_account_settings → activityTypes for the full list."),
         dateCreatedFrom: z.string().optional().describe("ISO date."),
         dateCreatedTo: z.string().optional(),
       },
@@ -469,6 +446,7 @@ function buildServer() {
       const filter = buildFilter([
         termClause("related.id", params.relatedJnid),
         termClause("is_status_change", params.isStatusChange),
+        termClause("record_type_name", params.recordTypeName),
         rangeClause("date_created", toUnixSeconds(params.dateCreatedFrom), toUnixSeconds(params.dateCreatedTo)),
       ]);
       const data = await jobNimbusRequest("/activities", { query: commonListQuery(params), filter });
@@ -496,7 +474,6 @@ function buildServer() {
     }
   );
 
-  // ---------- ESTIMATES (v2) ----------
   server.registerTool(
     "jobnimbus_list_estimates",
     {
@@ -542,7 +519,6 @@ function buildServer() {
     }
   );
 
-  // ---------- INVOICES (v2) ----------
   server.registerTool(
     "jobnimbus_list_invoices",
     {
@@ -591,7 +567,6 @@ function buildServer() {
     }
   );
 
-  // ---------- PAYMENTS ----------
   server.registerTool(
     "jobnimbus_list_payments",
     {
@@ -614,7 +589,6 @@ function buildServer() {
     }
   );
 
-  // ---------- BUDGETS (profit tracker) ----------
   server.registerTool(
     "jobnimbus_list_budgets",
     {
@@ -660,7 +634,6 @@ function buildServer() {
     }
   );
 
-  // ---------- MATERIAL ORDERS ----------
   server.registerTool(
     "jobnimbus_list_material_orders",
     {
@@ -760,7 +733,7 @@ function buildServer() {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
-// ---------- WORK ORDERS ----------
+
   server.registerTool(
     "jobnimbus_list_work_orders",
     {
@@ -865,18 +838,14 @@ function buildServer() {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
+
   return server;
 }
 
-// -----------------------------------------------------------------------
-// Express app hosting the MCP server over Streamable HTTP transport, plus
-// the OAuth endpoints Claude's connector flow needs.
-// -----------------------------------------------------------------------
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Tell OAuth-aware clients (like Claude) where the auth endpoints live.
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   const base = `${req.protocol}://${req.get("host")}`;
   res.json({
@@ -898,9 +867,6 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// Step 1 of the OAuth dance: Claude's browser gets redirected here. Since
-// this server has exactly one "user" (you), we auto-approve immediately
-// instead of showing a login page.
 app.get("/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } =
     req.query;
@@ -920,7 +886,7 @@ app.get("/authorize", (req, res) => {
     redirectUri: redirect_uri,
     codeChallenge: code_challenge || null,
     codeChallengeMethod: code_challenge_method || null,
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+    expiresAt: Date.now() + 5 * 60 * 1000,
   });
 
   const redirectUrl = new URL(redirect_uri);
@@ -929,12 +895,10 @@ app.get("/authorize", (req, res) => {
   res.redirect(302, redirectUrl.toString());
 });
 
-// Step 2: exchange the code (or a refresh token) for an access token.
 app.post("/token", (req, res) => {
   const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier, refresh_token } =
     req.body;
 
-  // Client auth can arrive as Basic auth instead of body params.
   let effectiveClientId = client_id;
   let effectiveClientSecret = client_secret;
   const authHeader = req.headers["authorization"];
