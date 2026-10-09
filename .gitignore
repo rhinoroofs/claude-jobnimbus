@@ -1,0 +1,4 @@
+jn_cache/
+__pycache__/
+*.xlsx
+payroll_parsed.csv
