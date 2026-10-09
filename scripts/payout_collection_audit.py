@@ -19,10 +19,10 @@ For every Demo / Install payout it pulls from JobNimbus:
 
 Payout date:
   - Default = the payroll sheet date.
-  - Optional: pass --nickel nickel_bills.csv (export of PAID Nickel bills with
-    columns: reference, vendorName, description, paidDate). When a Nickel bill
-    for the same job # is found within NICKEL_MATCH_WINDOW_DAYS of the payroll
-    date, its paid date is used instead.
+  - Optional: pass --nickel with Nickel's transactions export (Date, Payee/Vendor,
+    Amount, Status, Reference). A payroll line takes the date of the Nickel payable
+    to the same vendor for the same amount paid near the payroll date. A bills CSV
+    with reference (job #) + paidDate columns also works.
 
 Flag rules (edit in CONFIG below):
   - INSTALL flagged if collected at payout < contract (anything still owed).
@@ -40,6 +40,8 @@ Usage:
         --rhino Rhino_Roofs___Payroll.xlsx [--nickel nickel_bills.csv] \
         [--start 2026-06-01] [--out payout_collection_audit.xlsx]
 
+  python payout_collection_audit.py ... --jn-dump DIR  # use jobs.json / payments.json /
+                                                     # status_changes.json instead of the API
   python payout_collection_audit.py --probe 11518     # test the API on one job
   python payout_collection_audit.py ... --dry-run     # parse payroll only, no API
 
@@ -81,6 +83,17 @@ PAGE_SIZE = 1000
 DEMO_SECOND_PAYMENT_RATIO = 2 / 3  # demo OK if >= this share of contract collected
 OWED_TOLERANCE = 1.00              # ignore balances under $1 (rounding)
 NICKEL_MATCH_WINDOW_DAYS = 14
+
+# Nickel "transactions" export: a payroll line matches a Nickel payable to the same
+# vendor for the same amount (+/- NICKEL_AMOUNT_TOLERANCE), paid between
+# NICKEL_DAYS_BEFORE before and NICKEL_DAYS_AFTER after the payroll date.
+NICKEL_AMOUNT_TOLERANCE = 1.00
+NICKEL_DAYS_BEFORE = 7
+NICKEL_DAYS_AFTER = 30
+# Payroll sub names that share no word with their Nickel vendor name.
+NICKEL_VENDOR_ALIASES = {"victor": "lion king", "favian": "lf gutters"}
+VENDOR_STOPWORDS = {"llc", "inc", "corp", "roofing", "construction", "services", "service",
+                    "repairs", "group", "and", "more", "dba"}
 
 # Statuses that mean the 2nd payment is in (case-insensitive substring match).
 SECOND_PAYMENT_STATUSES = ["2nd payment done", "final invoice paid", "paid & closed"]
@@ -175,6 +188,40 @@ class JobNimbus:
             EP_JOBS,
             fields="jnid,number,name,address_line1,city,zip,status_name,date_created",
         )
+
+
+class OfflineJobNimbus:
+    """Same interface as JobNimbus, backed by JSON dumps in one folder:
+    jobs.json, payments.json, status_changes.json (lists of JobNimbus records,
+    e.g. pulled through the JobNimbus MCP connector when no API key is at hand)."""
+
+    def __init__(self, dump_dir):
+        def load(name):
+            with open(os.path.join(dump_dir, name)) as f:
+                return json.load(f)
+        self.jobs = load("jobs.json")
+        self.by_number = {str(j.get("number")): j for j in self.jobs}
+        self._payments, self._changes = {}, {}
+        for p in load("payments.json"):
+            for rel in p.get("related") or []:
+                if rel.get("type") == "job":
+                    self._payments.setdefault(rel["id"], []).append(p)
+        for a in load("status_changes.json"):
+            prim = a.get("primary") or {}
+            if prim.get("type") == "job":
+                self._changes.setdefault(prim["id"], []).append(a)
+
+    def job_by_number(self, number):
+        return self.by_number.get(str(number))
+
+    def status_changes(self, jnid):
+        return self._changes.get(jnid, [])
+
+    def payments(self, jnid):
+        return self._payments.get(jnid, [])
+
+    def all_jobs_light(self):
+        return self.jobs
 
 
 # =============================================================================
@@ -275,6 +322,7 @@ def norm_addr(s):
     s = str(s or "").lower()
     s = s.split(",")[0]                       # street part only
     s = re.sub(r"^(bldg|bld|building)\s*\d+\s*-\s*", "", s)
+    s = re.sub(r"^\s*(\d+)\s*-\s*\d+\b", r"\1", s)   # building ranges "8024 - 8038 X" -> "8024 X"
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     toks = []
     for t in s.split():
@@ -299,68 +347,120 @@ class AddressIndex:
                 continue
             self.by_num.setdefault(hn, []).append((norm_addr(a1), j))
 
-    def match(self, address):
+    @staticmethod
+    def _score(target, cand):
+        """Similarity, also comparing only the first words of the payroll address
+        (payroll often appends city / state / zip that JobNimbus keeps elsewhere)."""
+        tt, ct = target.split(), cand.split()
+        if len(tt) < 2 or len(ct) < 2:
+            return 0.0
+        full = difflib.SequenceMatcher(None, target, cand).ratio()
+        prefix = difflib.SequenceMatcher(None, " ".join(tt[:len(ct)]), cand).ratio()
+        return max(full, prefix)
+
+    def match(self, address, as_of=None):
         hn = house_number(address)
         if not hn or hn not in self.by_num:
             return None, 0.0, "no job with that house number"
         target = norm_addr(address)
-        best, best_score = None, 0.0
-        for cand_norm, job in self.by_num[hn]:
-            score = difflib.SequenceMatcher(None, target, cand_norm).ratio()
-            if score > best_score:
-                best, best_score = job, score
-        if best is None or best_score < ADDRESS_MATCH_CUTOFF:
+        scored = [(self._score(target, n), j) for n, j in self.by_num[hn]]
+        best_score = max(s for s, _ in scored)
+        if best_score < ADDRESS_MATCH_CUTOFF:
             return None, best_score, "address similarity below cutoff"
-        # ambiguity check: two different jobs at nearly the same score
-        close = [j for n, j in self.by_num[hn]
-                 if difflib.SequenceMatcher(None, target, n).ratio() >= best_score - 0.02
-                 and j.get("number") != best.get("number")]
-        if close:
-            nums = ", ".join(sorted({str(best.get("number"))} | {str(c.get("number")) for c in close}))
-            return best, best_score, f"ambiguous ({nums}) - picked most recent"
-        return best, best_score, "ok"
+        close = [j for s, j in scored if s >= best_score - 0.02]
+        nums = sorted({str(j.get("number")) for j in close})
+        if len(nums) == 1:
+            return close[0], best_score, "ok"
+        # same address on several jobs: most recent job created on/before the payout
+        cutoff = as_of.timestamp() + 86400 if as_of is not None else float("inf")
+        before = [j for j in close if (j.get("date_created") or 0) < cutoff] or close
+        best = max(before, key=lambda j: j.get("date_created") or 0)
+        return best, best_score, f"ambiguous ({', '.join(nums)}) - picked most recent before payout"
 
 
 # =============================================================================
 # Nickel paid-date matching (optional)
 # =============================================================================
+def vendor_words(name):
+    words = re.sub(r"[^a-z0-9 ]", "", str(name).lower().replace("/", " ").replace("-", " ")).split()
+    return {w for w in words if len(w) >= 3 and w not in VENDOR_STOPWORDS}
+
+
 def load_nickel(path):
+    """Accepts either Nickel's transactions export (Date, Payee/Vendor, Amount, Status,
+    Reference) or a bills CSV with reference + paidDate columns (job # in reference)."""
     if not path:
         return None
     n = pd.read_csv(path)
     cols = {c.lower(): c for c in n.columns}
+    if "payee/vendor" in cols and "amount" in cols:
+        n = n[n[cols["type"]].eq("Payable")
+              & n[cols["status"]].isin(["COMPLETED", "SENT", "DELIVERED"])].copy()
+        n["_vendor"] = n[cols["payee/vendor"]].astype(str)
+        n["_amt"] = pd.to_numeric(n[cols["amount"]].astype(str).str.replace(r"[$,]", "", regex=True),
+                                  errors="coerce")
+        n["_paid"] = pd.to_datetime(n[cols["date"]], errors="coerce")
+        n["_ref"] = n[cols["reference"]].astype(str)
+        n["_words"] = n["_vendor"].map(vendor_words)
+        n.attrs["format"] = "transactions"
+        return n.dropna(subset=["_amt", "_paid"]).reset_index(drop=True)
     ref = cols.get("reference")
     paid = cols.get("paiddate") or cols.get("paid_date") or cols.get("paid date")
     if not ref or not paid:
-        sys.exit("Nickel CSV needs 'reference' and 'paidDate' columns.")
+        sys.exit("Nickel CSV needs either Payee/Vendor + Amount + Date columns "
+                 "or 'reference' and 'paidDate' columns.")
     n["_job"] = n[ref].astype(str).str.extract(r"^\s*(\d{3,6})")[0]
     n["_paid"] = pd.to_datetime(n[paid], errors="coerce")
     desc = cols.get("description")
     n["_desc"] = n[desc].astype(str).str.lower() if desc else ""
+    n.attrs["format"] = "bills"
     return n.dropna(subset=["_job", "_paid"])
 
 
-def nickel_paid_date(nickel, job_number, payroll_date, kind):
-    if nickel is None or not job_number:
-        return None
+def nickel_match(nickel, row, used):
+    """(paid date, note) of the Nickel payment for one payroll line, or (None, reason).
+    `used` holds Nickel row indexes already matched, so one payment is used once."""
+    if nickel is None:
+        return None, ""
+    payroll_date = row["payroll_date"]
+    if nickel.attrs.get("format") == "transactions":
+        sub = str(row["sub"]).lower()
+        want = vendor_words(sub)
+        want |= {w for k, v in NICKEL_VENDOR_ALIASES.items() if k in sub for w in vendor_words(v)}
+        c = nickel[(~nickel.index.isin(used))
+                   & ((nickel["_amt"] - row["amount"]).abs() <= NICKEL_AMOUNT_TOLERANCE)
+                   & (nickel["_paid"] >= payroll_date - pd.Timedelta(days=NICKEL_DAYS_BEFORE))
+                   & (nickel["_paid"] <= payroll_date + pd.Timedelta(days=NICKEL_DAYS_AFTER))]
+        c = c[c["_words"].map(lambda w: bool(w & want))]
+        if c.empty:
+            return None, "no Nickel payment with same vendor + amount"
+        i = (c["_paid"] - payroll_date).abs().idxmin()
+        used.add(i)
+        return c.at[i, "_paid"], f"{c.at[i, '_vendor']} ${c.at[i, '_amt']:,.2f} ref: {c.at[i, '_ref']}"
+    job_number = row["job_number"]
+    if not job_number:
+        return None, ""
     c = nickel[nickel["_job"] == str(job_number)].copy()
-    if c.empty:
-        return None
-    word = "demo" if kind == "Demo" else "install"
+    word = "demo" if row["kind"] == "Demo" else "install"
     pref = c[c["_desc"].str.contains(word, na=False)]
     if not pref.empty:
         c = pref
     c["_gap"] = (c["_paid"] - payroll_date).abs()
     c = c[c["_gap"] <= pd.Timedelta(days=NICKEL_MATCH_WINDOW_DAYS)]
     if c.empty:
-        return None
-    return c.sort_values("_gap").iloc[0]["_paid"]
+        return None, "no Nickel bill for job # near payroll date"
+    return c.sort_values("_gap").iloc[0]["_paid"], "bill for job #"
 
 
 # =============================================================================
 # Status / payment helpers
 # =============================================================================
-STATUS_TO_RE = re.compile(r"\bto\s+[\"']?([^\"'\n]+?)[\"']?\s*$", re.IGNORECASE)
+# JobNimbus writes job status changes as either "Job Updated\nStatus: A => B" or
+# "Status changed from A to B". Names can contain " to " ("Job to be Scheduled"),
+# so the second form is resolved against the account's known status names.
+STATUS_ARROW_RE = re.compile(r"^Status: .*? => (.+?)\s*$", re.MULTILINE)
+STATUS_FROM_TO_RE = re.compile(r"^Status changed from (.+)$", re.MULTILINE)
+KNOWN_STATUSES = set()
 
 
 def ts(v):
@@ -372,14 +472,29 @@ def ts(v):
 
 
 def new_status_from_activity(a):
+    """New status name, or None when the activity is not a job status change."""
     for k in ("status_name_new", "new_status_name", "status_name"):
         if a.get(k):
             return str(a[k])
     note = str(a.get("note") or "")
-    m = STATUS_TO_RE.search(note)
+    m = STATUS_ARROW_RE.search(note)
     if m:
         return m.group(1).strip()
-    return note.strip() or "Unknown"
+    m = STATUS_FROM_TO_RE.search(note)
+    if m:
+        parts = m.group(1).split(" to ")
+        tails = [" to ".join(parts[i:]).strip().rstrip(".") for i in range(1, len(parts))]
+        known = [t for i, t in enumerate(tails)
+                 if t in KNOWN_STATUSES or " to ".join(parts[:i + 1]) in KNOWN_STATUSES]
+        return known[0] if known else (tails[-1] if tails else None)
+    return None
+
+
+def learn_status_names(changes):
+    """Add the unambiguous "A => B" names to KNOWN_STATUSES."""
+    for a in changes:
+        for m in re.finditer(r"^Status: (.+?) => (.+?)\s*$", str(a.get("note") or ""), re.MULTILINE):
+            KNOWN_STATUSES.update((m.group(1).strip(), m.group(2).strip()))
 
 
 def status_on(changes, when):
@@ -388,8 +503,9 @@ def status_on(changes, when):
     best_t, best_s = None, None
     for a in changes:
         t = ts(a.get("date_created"))
-        if t and t < cutoff and (best_t is None or t > best_t):
-            best_t, best_s = t, new_status_from_activity(a)
+        status = new_status_from_activity(a)
+        if status and t and t < cutoff and (best_t is None or t > best_t):
+            best_t, best_s = t, status
     return best_s, best_t
 
 
@@ -409,6 +525,26 @@ def collected_by(payments, when):
         if t and t < cutoff:
             s += paid_amount(p)
     return round(s, 2)
+
+
+def date_collected_reached(payments, amount):
+    """UTC date the running collected total first reached `amount`, or None."""
+    running = 0.0
+    dated = [(ts(p.get("date_payment")) or ts(p.get("date_created")), paid_amount(p))
+             for p in payments if p.get("is_active", True)]
+    for t, amt in sorted((d for d in dated if d[0]), key=lambda d: d[0]):
+        running += amt
+        if running >= amount:
+            return t.date()
+    return None
+
+
+def is_financed(payments, contract):
+    """Paid by a lender: a payment referenced 'finance', or one payment covering ~all of it."""
+    active = [p for p in payments if p.get("is_active", True)]
+    if any("financ" in str(p.get("reference") or "").lower() for p in active):
+        return True
+    return contract > 0 and len(active) == 1 and paid_amount(active[0]) >= contract * 0.9
 
 
 def collected_total(payments):
@@ -440,7 +576,13 @@ def run(args):
         print("Dry run: wrote payroll_parsed.csv")
         return
 
-    jn = JobNimbus(JN_BASE_URL, JN_API_KEY, use_cache=not args.no_cache)
+    if args.jn_dump:
+        jn = OfflineJobNimbus(args.jn_dump)
+        KNOWN_STATUSES.update(j.get("status_name") for j in jn.jobs if j.get("status_name"))
+        for changes in jn._changes.values():
+            learn_status_names(changes)
+    else:
+        jn = JobNimbus(JN_BASE_URL, JN_API_KEY, use_cache=not args.no_cache)
     nickel = load_nickel(args.nickel)
 
     # --- resolve address-only rows ------------------------------------------
@@ -452,7 +594,7 @@ def run(args):
             if pd.notna(r["job_number"]):
                 match_note[i] = "job # on payroll"
                 continue
-            job, score, note = idx.match(r["address"])
+            job, score, note = idx.match(r["address"], r["payroll_date"])
             if job:
                 payroll.at[i, "job_number"] = str(job.get("number"))
                 match_note[i] = f"address match {score:.2f} ({note})"
@@ -471,9 +613,12 @@ def run(args):
             continue
         jnid = job["jnid"]
         changes = jn.status_changes(jnid)
+        learn_status_names(changes)
         pays = jn.payments(jnid)
         job_cache[num] = {"job": job, "changes": changes, "payments": pays}
         for a in changes:
+            if not new_status_from_activity(a):
+                continue
             status_log.append({
                 "Job #": num,
                 "Changed At (UTC)": ts(a.get("date_created")),
@@ -483,7 +628,7 @@ def run(args):
         print(f"  {num}: {len(changes)} status changes, {len(pays)} payments")
 
     # --- evaluate each payout -----------------------------------------------
-    out = []
+    out, nickel_used = [], set()
     for _, r in payroll.iterrows():
         num = r["job_number"] if pd.notna(r["job_number"]) else None
         rec = {
@@ -504,7 +649,7 @@ def run(args):
             continue
 
         job = data["job"]
-        npd = nickel_paid_date(nickel, num, r["payroll_date"], r["kind"])
+        npd, nickel_note = nickel_match(nickel, r, nickel_used)
         payout_dt = (npd if npd is not None else r["payroll_date"]).to_pydatetime()
         status_then, status_then_at = status_on(data["changes"], payout_dt)
         contract = contract_value(job)
@@ -512,6 +657,16 @@ def run(args):
         coll_now = collected_total(data["payments"])
 
         rule = "Install" if r["kind"] in ("Install", "Demo + Install") else "Demo"
+        needed = (contract - OWED_TOLERANCE if rule == "Install"
+                  else contract * DEMO_SECOND_PAYMENT_RATIO - OWED_TOLERANCE)
+        met_on = date_collected_reached(data["payments"], needed) if contract > 0 else None
+        checks = []
+        if (str(job.get("status_name") or "").lower() in ("paid & closed", "final invoice paid")
+                and contract - coll_now > OWED_TOLERANCE):
+            checks.append("status says paid but JobNimbus payments don't add up to contract")
+        if (rule == "Install" and second_payment_status(status_then)
+                and "2nd payment" not in str(status_then).lower() and contract - coll_then > OWED_TOLERANCE):
+            checks.append("status said paid at payout but payment dated later")
         if rule == "Install":
             flagged = (contract - coll_then) > OWED_TOLERANCE
             reason = "final payment not collected" if flagged else ""
@@ -521,9 +676,10 @@ def run(args):
             reason = "2nd payment not collected" if flagged else ""
 
         rec.update({
-            "Job Name": job.get("name"),
+            "Job Name": job.get("name") or ", ".join(x for x in (job.get("address_line1"), job.get("city")) if x),
             "Payout Date Used": payout_dt.date(),
             "Payout Date Source": "Nickel" if npd is not None else "Payroll sheet",
+            "Nickel Match": nickel_note,
             "Status When Paid": status_then or "No status change on/before payout",
             "Status Since": status_then_at.date() if status_then_at else None,
             "Contract": contract,
@@ -531,6 +687,10 @@ def run(args):
             "Collected Now": coll_now,
             "Status Now": job.get("status_name"),
             "Rule Applied": rule,
+            "Threshold Met On": met_on,
+            "Days Paid Early": (met_on - payout_dt.date()).days if met_on and met_on > payout_dt.date() else None,
+            "Financed": "YES" if is_financed(data["payments"], contract) else "",
+            "Data Check": "; ".join(checks),
             "Flagged": "YES" if flagged else "no",
             "Reason": reason,
             "Problem": "" if contract > 0 else "contract total is $0 in JobNimbus - check job",
@@ -549,11 +709,12 @@ COLS = [
     "Payroll Date", "Payout Date Used", "Payout Date Source", "Payout Amount",
     "Status When Paid", "Status Since", "Contract", "Collected When Paid",
     "Owed When Paid", "Collected Now", "Owed Now", "Still Open?", "Status Now",
-    "Flagged", "Reason", "Source", "Match Note", "Problem",
+    "Flagged", "Reason", "Threshold Met On", "Days Paid Early", "Financed", "Data Check",
+    "Source", "Match Note", "Nickel Match", "Problem",
 ]
 MONEY = {"Payout Amount", "Contract", "Collected When Paid", "Owed When Paid",
          "Collected Now", "Owed Now"}
-DATES = {"Payroll Date", "Payout Date Used", "Status Since"}
+DATES = {"Payroll Date", "Payout Date Used", "Status Since", "Threshold Met On"}
 
 
 def style_header(ws, ncols):
@@ -595,7 +756,8 @@ def write_payout_sheet(ws, df):
             for j in range(1, len(COLS) + 1):
                 ws.cell(row=i, column=j).fill = flag_fill
     widths = {"Job Name": 34, "Address (payroll)": 34, "Sub": 30, "Status When Paid": 24,
-              "Status Now": 22, "Reason": 26, "Match Note": 34, "Problem": 30}
+              "Status Now": 22, "Reason": 26, "Match Note": 34, "Nickel Match": 40,
+              "Problem": 30, "Data Check": 40}
     for name, letter in col.items():
         ws.column_dimensions[letter].width = widths.get(name, 14)
     if len(df):
@@ -645,30 +807,36 @@ def write_workbook(df, status_log, path):
         ("Payout Collection Audit", None),
         ("Generated", datetime.now().strftime("%m/%d/%Y %I:%M %p")),
         (None, None),
-        ("Demo/Install payout lines reviewed", f"=COUNTA({A}!A:A)-1"),
-        ("Flagged payout lines", f"=COUNTA({F}!A:A)-1"),
+        ("Demo/Install payout lines reviewed", f"=COUNTA({A}!{cl['Kind']}:{cl['Kind']})-1"),
+        ("Flagged payout lines", f"=COUNTA({F}!{cl['Kind']}:{cl['Kind']})-1"),
         ("  Install paid before final payment", f"=COUNTIF({F}!{cl['Rule Applied']}:{cl['Rule Applied']},\"Install\")"),
         ("  Demo paid before 2nd payment", f"=COUNTIF({F}!{cl['Rule Applied']}:{cl['Rule Applied']},\"Demo\")"),
         ("Flagged lines still open today", f"=COUNTIF({F}!{cl['Still Open?']}:{cl['Still Open?']},\"YES\")"),
         ("Flagged lines since collected", f"=COUNTIF({F}!{cl['Still Open?']}:{cl['Still Open?']},\"no\")"),
+        ("  of those, collected within 7 days of payout", f"=COUNTIFS({F}!{cl['Days Paid Early']}:{cl['Days Paid Early']},\"<=7\",{F}!{cl['Still Open?']}:{cl['Still Open?']},\"no\")"),
+        ("Flagged lines on financed jobs", f"=COUNTIF({F}!{cl['Financed']}:{cl['Financed']},\"YES\")"),
+        ("Flagged lines with a data check note", f"=COUNTIF({F}!{cl['Data Check']}:{cl['Data Check']},\"?*\")"),
         (None, None),
         ("Sub $ paid on flagged lines", f"=SUM({F}!{cl['Payout Amount']}:{cl['Payout Amount']})"),
         ("Owed at time of payout (flagged)", f"=SUM({F}!{cl['Owed When Paid']}:{cl['Owed When Paid']})"),
         ("Owed today on flagged jobs (sum by line)", f"=SUMIF({F}!{cl['Still Open?']}:{cl['Still Open?']},\"YES\",{F}!{cl['Owed Now']}:{cl['Owed Now']})"),
-        ("Rows needing review (Unmatched tab)", "=COUNTA('Unmatched Rows'!A:A)-1"),
+        ("Rows needing review (Unmatched tab)", f"=COUNTA('Unmatched Rows'!{cl['Kind']}:{cl['Kind']})-1"),
         (None, None),
         ("Rules", None),
         ("Install flagged if", f"anything still owed at payout (> ${OWED_TOLERANCE:,.2f})"),
         ("Demo flagged if", f"< {DEMO_SECOND_PAYMENT_RATIO:.0%} of contract collected AND status not in: {', '.join(SECOND_PAYMENT_STATUSES)}"),
         ("Contract", "max(approved estimate total, approved invoice total) in JobNimbus"),
-        ("Payout date", "Nickel paid date when --nickel CSV supplied and matched, else payroll sheet date"),
+        ("Payout date", "Nickel paid date when --nickel CSV supplied and matched (same vendor + amount), else payroll sheet date"),
         ("Note", "A job with multiple flagged lines is counted once per line; filter 'Flagged Payouts' by Job # for unique jobs."),
     ]
+    money_rows = {"Sub $ paid on flagged lines", "Owed at time of payout (flagged)",
+                  "Owed today on flagged jobs (sum by line)"}
     for i, (k, v) in enumerate(rows, start=1):
-        summ.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=(i in (1, 16)), size=14 if i == 1 else 10)
+        summ.cell(row=i, column=1, value=k).font = Font(name=FONT, bold=k in ("Payout Collection Audit", "Rules"),
+                                                         size=14 if i == 1 else 10)
         c = summ.cell(row=i, column=2, value=v)
         c.font = Font(name=FONT)
-        if i in (11, 12, 13):
+        if k in money_rows:
             c.number_format = '$#,##0.00;($#,##0.00);"-"'
     summ.column_dimensions["A"].width = 42
     summ.column_dimensions["B"].width = 90
@@ -707,6 +875,8 @@ def main():
     ap.add_argument("--out", default="payout_collection_audit.xlsx")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--jn-dump", help="folder with jobs.json / payments.json / status_changes.json "
+                                      "to use instead of calling the JobNimbus API")
     ap.add_argument("--probe", help="job # to test API calls on")
     args = ap.parse_args()
 
