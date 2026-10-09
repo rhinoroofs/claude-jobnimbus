@@ -383,7 +383,8 @@ class AddressIndex:
 # =============================================================================
 def vendor_words(name):
     words = re.sub(r"[^a-z0-9 ]", "", str(name).lower().replace("/", " ").replace("-", " ")).split()
-    return {w for w in words if len(w) >= 3 and w not in VENDOR_STOPWORDS}
+    # drop a trailing "s" so "Pacheco's" / "Pacheco" and "Mateo's" / "Mateos" match
+    return {w.rstrip("s") for w in words if len(w) >= 3 and w not in VENDOR_STOPWORDS}
 
 
 def load_nickel(path):
